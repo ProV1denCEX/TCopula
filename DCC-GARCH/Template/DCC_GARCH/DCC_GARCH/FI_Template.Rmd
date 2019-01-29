@@ -1,0 +1,214 @@
+---
+title: "FI Project Template"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Why Gaussian copula does not perform well. 
+1. Empirical Data Analysis
+```{r}
+library(data.table)
+library(xts)
+freturn_df = fread('10F_1Vol_all_freturn.csv')
+freturn_df$Date = as.Date(freturn_df$Date)
+freturn_ts = as.xts(freturn_df)
+
+library(copula)
+before_market_crash = freturn_ts["2011-08-04/2016-01-31"]
+before_VMom_crash = freturn_ts["2016-02-01/2018-02-14"]
+after_YTD = freturn_ts["2018-02-15/2018-10-26"]
+
+library(psych)
+pairs.panels(as.matrix(before_market_crash))
+pairs.panels(as.matrix(before_VMom_crash))
+pairs.panels(as.matrix(after_YTD))
+```
+
+2. Use CIC and cross-validation to select Copula
+The best copula should has the largest CIC score.
+```{r message=FALSE, warning=FALSE}
+# before_market_crash
+xvCopula(gumbelCopula(dim = 10), as.matrix(before_market_crash)) #dim = num of assets
+xvCopula(frankCopula(dim = 10), as.matrix(before_market_crash))
+xvCopula(joeCopula(dim = 10), as.matrix(before_market_crash))
+xvCopula(claytonCopula(dim = 10), as.matrix(before_market_crash))
+xvCopula(normalCopula(dim = 10), as.matrix(before_market_crash))
+xvCopula(tCopula(dim = 10), as.matrix(before_market_crash))
+
+# before_VMom_crash
+xvCopula(gumbelCopula(dim = 10), as.matrix(before_VMom_crash))
+xvCopula(frankCopula(dim = 10), as.matrix(before_VMom_crash))
+xvCopula(joeCopula(dim = 10), as.matrix(before_VMom_crash))
+xvCopula(claytonCopula(dim = 10), as.matrix(before_VMom_crash))
+xvCopula(normalCopula(dim = 10), as.matrix(before_VMom_crash))
+xvCopula(tCopula(dim = 10), as.matrix(before_VMom_crash))
+
+# after_YTD
+xvCopula(gumbelCopula(dim = 10), as.matrix(after_YTD))
+xvCopula(frankCopula(dim = 10), as.matrix(after_YTD))
+xvCopula(joeCopula(dim = 10), as.matrix(after_YTD))
+xvCopula(claytonCopula(dim = 10), as.matrix(after_YTD))
+xvCopula(normalCopula(dim = 10), as.matrix(after_YTD))
+xvCopula(tCopula(dim = 10), as.matrix(after_YTD))
+```
+
+To visualise the copula, we use counter plot on empirical copula on selected two factors(assets).
+```{r message=FALSE, warning=FALSE}
+pair = as.matrix(before_market_crash)
+x = 9
+y = 10
+fj = fitCopula(claytonCopula(dim = 2), pobs(pair[,c(x,y)]))
+contour(fj@copula, FUN = pCopula,xlab=colnames(pair)[x], ylab=colnames(pair)[y],main = 'clayton')
+```
+
+```{r message=FALSE, warning=FALSE}
+fn = fitCopula(normalCopula(dim = 2), pobs(pair[,c(x,y)]))
+contour(fn@copula, FUN = pCopula,xlab=colnames(pair)[x], ylab=colnames(pair)[y],main = 'normal')
+```
+
+## Use Copula-DCC-GRACH with different copulas to conduct rolling 1-month forcast
+1. Rolling Model
+```{r message=FALSE, warning=FALSE}
+# reload data
+freturn_df = fread('AFreturn800.csv')
+Date_list = as.Date(freturn_df$Factor)
+freturn_df$Factor = NULL
+# find month-end date
+library(zoo)
+#flag = rev(shift(rev(as.numeric(diff(as.yearmon(Date_list)))),1))
+flag = as.numeric(diff(as.yearmon(Date_list)))
+monthend_list = Date_list[flag!=0]
+monthend_list = na.omit(monthend_list)
+head(monthend_list)
+```
+```{r message=FALSE, warning=FALSE}
+# empirical mean process order
+tail(monthend_list)
+library(rmgarch)
+library(forecast)
+for (col in colnames(freturn_df)){
+  tmp = auto.arima(freturn_df[[col]],d=0)
+  print(paste(col,'ARMA'))
+  print(arimaorder(tmp))
+}
+```
+
+```{r message=FALSE, warning=FALSE}
+library(parallel)
+library(PerformanceAnalytics)
+library(RiskPortfolios)
+cumret = function(x){
+  return(prod(1+x)-1)
+}
+# rolling fit
+start_month = monthend_list[24] #leave 24 months for training, you can choose other lookback horizon.
+train_period = monthend_list[monthend_list>start_month]
+asset_names = colnames(freturn_df)
+print(asset_names)
+
+# bias stat time series
+cor_normal_bias_vec = c()
+cor_std_bias_vec = c()
+cvar_ew_normal_bias = c() #equal weight portfolio bias
+cvar_ew_std_bias = c()
+# config simulation times and cvar alpha level
+sim_times = 1000
+alpha = 0.05
+half_life = 21
+for(i in 1:(length(train_period)-1)){
+  cluster = makeCluster(4) # Create a cluster with 4 workers
+
+  #leave one month for rolling out of sample
+  print(train_period[i])
+  #choose training set
+  period_end = train_period[i]
+  period_start = monthend_list[which(monthend_list==period_end)-24]
+  data_used = freturn_df[which(Date_list==period_start):which(Date_list==period_end),]
+  next_monthend = train_period[i+1]
+  period_len = length(Date_list[which(Date_list==period_end):which(Date_list==next_monthend)])-1
+  #####
+  # DCC timecopula MVN (check against DCC-NORM)
+  #uspec = ugarchspec(mean.model = list(armaOrder = c(2,1)),
+  #                   variance.model = list(garchOrder = c(1,1), model = "sGARCH",
+  #                                         variance.targeting=FALSE),distribution.model = "norm")
+  #spec1 = cgarchspec(uspec = multispec(replicate(3, uspec) ), asymmetric = TRUE,
+  #                   distribution.model = list(copula = "mvnorm", method = "Kendall",
+  #                                             time.varying = TRUE, transformation = "parametric"))
+  
+  # Select order and set uspec
+  uspec_vec= c()
+  uspec_std_vec = c()
+  for (col in colnames(data_used)){
+    tmp = auto.arima(data_used[[col]],d=0)
+    uspec = ugarchspec(mean.model = list(armaOrder = c(arimaorder(tmp)[1],arimaorder(tmp)[3])),
+                       variance.model = list(garchOrder = c(1,1), model = "sGARCH",
+                       variance.targeting=FALSE),distribution.model = "norm")
+    uspec_std = ugarchspec(mean.model = list(armaOrder = c(arimaorder(tmp)[1],arimaorder(tmp)[3])),
+                           variance.model = list(garchOrder = c(1,1), model = "sGARCH"),
+                           distribution.model = "std", fixed.pars = list(shape = 6))
+    uspec_vec = c(uspec_vec,uspec)
+    uspec_std_vec = c(uspec_std_vec,uspec_std)
+  }
+  spec = cgarchspec(uspec = multispec(uspec_vec), asymmetric = TRUE,
+                    distribution.model = list(copula = "mvnorm", method = "Kendall",
+                                              time.varying = TRUE, transformation = "parametric"))
+  #fit_normal = cgarchfit(spec, data = as.matrix(data_used), cluster = cluster,solver.control=list(trace=0))#trace = 1 show optimization process,multiprocessing
+  fit_normal = cgarchfit(spec, data = as.matrix(data_used),solver.control=list(trace=0))
+  #simulation 10000times,period_len step forecast
+  sim_normal = cgarchsim(fit_normal, n.sim = period_len,n.start = dim(data_used)[1],m.sim = sim_times, cluster = cluster,startMethod = "sample") 
+  cor_normal_f = rcor(sim_normal)[,,period_len] #forcast correlation
+  cov_normal_f = rcov(sim_normal)[,,period_len] #forcast correlation
+  
+  scenario_ret_normal = matrix(0, sim_times,length(asset_names))
+  for(j in 1:sim_times) scenario_ret_normal[j,] = apply(sim_normal@msim$simX[[j]]+1,2,prod)-1 #simX is simulation return series
+  # equal-weight portfolio cVaR at alpha level
+  scenario_portfolio_normal = apply(scenario_ret_normal,1,mean)
+  cvar_ew_normal = ES(scenario_portfolio_normal, p = 1-alpha, method = "historical") 
+  #####
+  # DCC timecopula MVT (check against DCC-Student)--> They should be the same
+  spec_std = cgarchspec(uspec = multispec(uspec_std_vec), VAR = FALSE,
+                        robust = FALSE, lag = 1, lag.max = NULL,
+                        lag.criterion = c("AIC", "HQ", "SC", "FPE"), external.regressors = NULL,
+                        robust.control = list("gamma" = 0.25, "delta" = 0.01, "nc" = 10, "ns" = 500),
+                        dccOrder = c(1,1), asymmetric = TRUE,
+                        distribution.model = list(copula = c("mvnorm", "mvt")[2],
+                                                  method = c("Kendall", "ML")[1], time.varying = TRUE,
+                                                  transformation = c("parametric", "empirical", "spd")[1]),
+                        start.pars = list(), fixed.pars = list(mshape = 6))
+  fit_std = cgarchfit(spec_std, data = as.matrix(data_used), solver.control=list(trace=0))
+  sim_std = cgarchsim(fit_std, n.sim = period_len,n.start = dim(data_used)[1],m.sim = sim_times, cluster = cluster,startMethod = "sample") 
+  cor_std_f = rcor(sim_std)[,,period_len] #forcast correlation
+  cov_std_f = rcov(sim_std)[,,period_len] #forcast correlation
+  scenario_ret_std = matrix(0, sim_times,length(asset_names))
+  for(j in 1:sim_times) scenario_ret_std[j,] = apply(sim_std@msim$simX[[j]]+1,2,prod)-1 #simX is simulation return series
+  scenario_portfolio_std = apply(scenario_ret_std,1,mean)
+  cvar_ew_std = ES(scenario_portfolio_std, p = 1-alpha, method = "historical") 
+  #####
+  #compare result to realized cor/cov/cvar
+  lookback_start = monthend_list[which(monthend_list==period_end)-12] #lookback 12 month for realized stat
+  data_lookedback = freturn_df[which(Date_list==lookback_start):which(Date_list==next_monthend),]
+  
+  lambda = exp(log(0.5)/half_life)
+  cov_ewma_realized = covEstimation(as.matrix(data_lookedback), control = list(type ='ewma', lambda =lambda))
+  cor_ewma_realized = cov2cor(cov_ewma_realized)
+  # bias stat
+  bias_cor_n = norm(cor_normal_f-cor_ewma_realized, type =  "F")/norm(cor_ewma_realized, type =  "F")
+  bias_cor_std = norm(cor_std_f-cor_ewma_realized, type =  "F")/norm(cor_ewma_realized, type =  "F")
+  cor_normal_bias_vec = c(cor_normal_bias_vec,bias_cor_n)
+  cor_std_bias_vec = c(cor_std_bias_vec,bias_cor_std)
+  # cvar bias
+  forward_start = Date_list[which(Date_list==period_end)+1]
+  data_lookedback = freturn_df[which(Date_list==forward_start):which(Date_list==next_monthend),]
+  realized_cvar = apply(data_lookedback,1,mean)
+  realized_cvar = ES(realized_cvar, p = 1-alpha, method = "gaussian") 
+  cvar_bias_n = min(0,cvar_ew_normal-realized_cvar)/abs(realized_cvar)
+  cvar_bias_std = min(0,cvar_ew_std-realized_cvar)/abs(realized_cvar)
+  cvar_ew_std_bias = c(cvar_ew_std_bias,cvar_bias_std)
+  cvar_ew_normal_bias = c(cvar_ew_normal_bias,cvar_bias_n)
+  stopCluster(cluster)
+}
+# results in cvar_ew_std/normal_bias,cor_normal_bias_vec
+```
